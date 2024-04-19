@@ -7,15 +7,18 @@ import sqlite3
 
 from langchain.prompts import ChatPromptTemplate
 from langchain.prompts.chat import SystemMessagePromptTemplate, HumanMessagePromptTemplate
-#from langchain_openai import OpenAI, AzureOpenAI
-#from langchain_openai import ChatOpenAI, AzureChatOpenAI
-#from langchain_openai import OpenAIEmbeddings
+from langchain_community.document_loaders import CSVLoader
+from langchain_community.vectorstores import Chroma
 
-from ibm_watson_machine_learning import APIClient
-from ibm_watson_machine_learning.foundation_models import Model
-from ibm_watson_machine_learning.metanames import GenTextParamsMetaNames as GenParams
-from ibm_watson_machine_learning.foundation_models.extensions.langchain import WatsonxLLM
-from ibm_watson_machine_learning.foundation_models.utils.enums import DecodingMethods
+from ibm_watsonx_ai import APIClient
+from ibm_watsonx_ai.foundation_models import Model
+from ibm_watsonx_ai.metanames import GenTextParamsMetaNames as GenParams
+from ibm_watsonx_ai.foundation_models.extensions.langchain import WatsonxLLM
+from ibm_watsonx_ai.foundation_models.utils.enums import DecodingMethods
+from ibm_watsonx_ai.foundation_models.utils import get_embedding_model_specs
+from ibm_watsonx_ai.foundation_models import Embeddings
+from ibm_watsonx_ai.foundation_models.utils.enums import EmbeddingTypes
+
 
 from dotenv import load_dotenv
 
@@ -35,9 +38,9 @@ ibm_cloud_api_key = os.getenv("IBM_CLOUD_API_KEY")
 project_id=os.getenv("IBM_CLOUD_PROJECT_ID")
 
 generate_params = {
-    GenParams.MAX_NEW_TOKENS : 200,
-    GenParams.TEMPERATURE : 0.1,
-    GenParams.DECODING_METHOD : DecodingMethods.SAMPLE
+    GenParams.MAX_NEW_TOKENS : 100,
+    GenParams.TEMPERATURE : 0.0,
+    GenParams.DECODING_METHOD : DecodingMethods.GREEDY
 }
 
 wml_credentials = {
@@ -46,7 +49,7 @@ wml_credentials = {
                   }
 
 llama_70b_model_chat_model = Model(
-    model_id='ibm-mistralai/mixtral-8x7b-instruct-v01-q',
+    model_id='meta-llama/llama-2-13b-chat',
     credentials=wml_credentials,
     params=generate_params,
     project_id=project_id
@@ -54,6 +57,12 @@ llama_70b_model_chat_model = Model(
 
 
 chat_llm = WatsonxLLM(llama_70b_model_chat_model)
+
+embeddings = Embeddings(
+    model_id=EmbeddingTypes.IBM_SLATE_30M_ENG,
+    credentials=wml_credentials,
+    project_id=project_id
+)
 #
 #openai_api_key = os.getenv("OPENAI_API_KEY")
 
@@ -97,6 +106,51 @@ def save_db_details(db_uri):
     
     return unique_id
 
+def create_vectors(filename,persist_directory):
+    loader = CSVLoader(file_path=filename, encoding='utf8')
+    data = loader.load()
+    vectordb = Chroma.from_documents(data, embedding=embeddings, persist_directory=persist_directory)
+    vectordb.persist()
+
+def check_if_user_wants_sql_query(query):
+    template = ChatPromptTemplate.from_messages(
+        [
+         SystemMessagePromptTemplate.from_template(
+             f"You are assistant who is an expert in writing SQL queries"
+             f"Given the below text from the user, figure out if user wants you to write a SQL query or create a report"
+             f"Answer 'yes' if wants to write a SQL query or generate a report or data analysis"
+             f"Answer 'no' if the user is user is asking a general question not related to querying their data."
+             f"Your answer should be either 'yes' or 'no' do not answer anything else."
+             f"Below are few examples"
+         ),
+         HumanMessagePromptTemplate.from_template("{text}")   
+        ]
+    )
+    prompt_value = template.invoke({"text":query})
+    prompt_value = prompt_value.to_string()
+    print(prompt_value)
+    answer = chat_llm(prompt_value)
+    print("query classification answer")
+    return answer
+
+def prompt_when_query_not_needed(query):
+    template = ChatPromptTemplate.from_messages(
+        [
+            SystemMessagePromptTemplate.from_template(
+               f"You are a virtual assistant"
+               f"Generate a polite, concise response to the users message below."
+               f"Be clear and concise. Only respond to user message do not add any additional infromation."
+            ),
+            HumanMessagePromptTemplate.from_template("{text}")
+        ]
+    )
+    
+    prompt_value = template.invoke({"text":query})
+    prompt_value = prompt_value.to_string()
+    
+    answer = chat_llm(prompt_value)
+    
+    return answer
 
 
 def generate_template_for_sql(query, table_info, db_uri):
@@ -125,28 +179,45 @@ def generate_template_for_sql(query, table_info, db_uri):
     return answer
 
 def get_output_from_llm(query, unique_id, db_uri):
-    ## Load the tables csv
-    filename_t = 'csvs/tables_' + unique_id + '.csv'
-    df = pd.read_csv(filename_t)
     
-    ## For each table create a string that lists down all the columns and their datatypes
-    table_info = ''
-    for table in df['table_name']:
-        table_info += 'Information about table' + table + ':\n'
-        table_info += df[df['table_name'] == table].to_string(index=False) + '\n\n\n'
+    #Check if user query wants a sql output
+    user_needs_sql_query = check_if_user_wants_sql_query(query=query)    
+    
+    # If user needs SQL query then get the list of tables and columns and call llm with sql query prompt
+    if user_needs_sql_query.lower().strip() == 'yes':
+        print("user needs SQL query")
+
+        ## Load the tables csv
+        filename_t = 'csvs/tables_' + unique_id + '.csv'
+        df = pd.read_csv(filename_t)
         
-    return generate_template_for_sql(query, table_info, db_uri)
-
-def execute_the_solution(solution, db_uri):
-    connection = sqlite3.connect(db_uri)
-    cursor = connection.cursor()
+        ## For each table create a string that lists down all the columns and their datatypes
+        table_info = ''
+        for table in df['table_name']:
+            table_info += 'Information about table' + table + ':\n'
+            table_info += df[df['table_name'] == table].to_string(index=False) + '\n\n\n'
+        
+        return {"is_query":True, "llm_response":generate_template_for_sql(query, table_info, db_uri)}
     
-    _,final_query,_ = solution.split("```")
-    final_query = final_query.strip('sql')
-    cursor.execute(final_query)
-    result = cursor.fetchall()
-    return str(result)
+    else: 
+        print("user asked a general query")
+        return {"is_query":False, "llm_response":prompt_when_query_not_needed(query)}
+    
 
+
+def execute_the_solution(solution, db_uri,is_query):
+    
+    if is_query == True: 
+        connection = sqlite3.connect(db_uri)
+        cursor = connection.cursor()
+        
+        _,final_query,_ = solution.split("```")
+        final_query = final_query.strip('sql')
+        cursor.execute(final_query)
+        result = cursor.fetchall()
+        return str(result)
+    else:
+        return "Not a SQL query so didn't run anything!"
 
 
 # Function to establish connection and read metadata from the database
@@ -157,8 +228,8 @@ def connect_with_db(uri):
 
 def send_message(message):
     solution = get_output_from_llm(message, st.session_state.unique_id, st.session_state.db_uri)
-    result = execute_the_solution(solution, st.session_state.db_uri)
-    return {"message":solution + "\n\n" + "Result:\n" + result}
+    result = execute_the_solution(solution["llm_response"], st.session_state.db_uri,solution["is_query"])
+    return {"message":solution["llm_response"] + "\n\n" + "Result:\n" + result}
 
 ## Instructions
 
