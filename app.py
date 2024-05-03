@@ -16,9 +16,9 @@ from ibm_watsonx_ai.metanames import GenTextParamsMetaNames as GenParams
 from ibm_watsonx_ai.foundation_models.extensions.langchain import WatsonxLLM
 from ibm_watsonx_ai.foundation_models.utils.enums import DecodingMethods
 from ibm_watsonx_ai.foundation_models.utils import get_embedding_model_specs
-from ibm_watsonx_ai.foundation_models import Embeddings
+#from ibm_watsonx_ai.foundation_models import Embeddings # USE WatsonxEmbeddings instead
 from ibm_watsonx_ai.foundation_models.utils.enums import EmbeddingTypes
-
+from langchain_ibm import WatsonxEmbeddings
 
 from dotenv import load_dotenv
 
@@ -35,32 +35,53 @@ for folder_name in folders_to_create:
 # Load API key and Initialize models
 load_dotenv()
 ibm_cloud_api_key = os.getenv("IBM_CLOUD_API_KEY")
-project_id=os.getenv("IBM_CLOUD_PROJECT_ID")
-
-generate_params = {
-    GenParams.MAX_NEW_TOKENS : 100,
-    GenParams.TEMPERATURE : 0.0,
-    GenParams.DECODING_METHOD : DecodingMethods.GREEDY
-}
+project_id = os.getenv("IBM_CLOUD_PROJECT_ID")
+watsonx_instance_url = os.getenv("IBM_WATSONX_URL")
 
 wml_credentials = {
-                   "url": "https://us-south.ml.cloud.ibm.com",
+                   "url": watsonx_instance_url,
                    "apikey":ibm_cloud_api_key
                   }
+# Classification Model
+generate_params_classify = {
+    GenParams.MAX_NEW_TOKENS : 20,
+    GenParams.TEMPERATURE : 0.0,
+    GenParams.DECODING_METHOD : DecodingMethods.GREEDY,
+    GenParams.STOP_SEQUENCES : ['yes','no'],
+    GenParams.REPETITION_PENALTY : 1
+}
 
-llama_70b_model_chat_model = Model(
-    model_id='meta-llama/llama-2-13b-chat',
+classification_model = Model(
+    model_id='google/flan-t5-xxl',
     credentials=wml_credentials,
-    params=generate_params,
+    params=generate_params_classify,
+    project_id=project_id
+) 
+
+classify_llm = WatsonxLLM(classification_model)
+
+# Chat model
+generate_params_chat = {
+    GenParams.MAX_NEW_TOKENS : 100,
+    GenParams.TEMPERATURE : 0.4,
+    GenParams.DECODING_METHOD : DecodingMethods.SAMPLE,
+    GenParams.STOP_SEQUENCES : ['<<eos>>']
+}
+
+chat_model = Model(
+    model_id='ibm-mistralai/mixtral-8x7b-instruct-v01-q',
+    credentials=wml_credentials,
+    params=generate_params_chat,
     project_id=project_id
 ) 
 
 
-chat_llm = WatsonxLLM(llama_70b_model_chat_model)
+chat_llm = WatsonxLLM(chat_model)
 
-embeddings = Embeddings(
-    model_id=EmbeddingTypes.IBM_SLATE_30M_ENG,
-    credentials=wml_credentials,
+embeddings = WatsonxEmbeddings(
+    model_id='ibm/slate-125m-english-rtrvr',
+    url=wml_credentials["url"],
+    apikey=wml_credentials["apikey"],
     project_id=project_id
 )
 #
@@ -97,9 +118,11 @@ def save_db_details(db_uri):
     
     df = pd.DataFrame(tables_and_columns, columns=['table_name', 'column_name', 'data_type'])
     # limiting data to only three tables to avoid exhausting the context limit
-    df = df[df["table_name"].isin(["customers", "invoices", "invoice_items"])]
+    #df = df[df["table_name"].isin(["customers", "invoices", "invoice_items"])]
     filename_t = 'csvs/tables_' + unique_id + '.csv'
     df.to_csv(filename_t, index=False)
+    
+    create_vectors(filename_t, "./vectors/tables_/"+ unique_id)
     
     cursor.close()
     connection.close()
@@ -111,35 +134,18 @@ def create_vectors(filename,persist_directory):
     data = loader.load()
     vectordb = Chroma.from_documents(data, embedding=embeddings, persist_directory=persist_directory)
     vectordb.persist()
-
-def check_if_user_wants_sql_query(query):
-    template = ChatPromptTemplate.from_messages(
-        [
-         SystemMessagePromptTemplate.from_template(
-             f"You are assistant who is an expert in writing SQL queries"
-             f"Given the below text from the user, figure out if user wants you to write a SQL query or create a report"
-             f"Answer 'yes' if wants to write a SQL query or generate a report or data analysis"
-             f"Answer 'no' if the user is user is asking a general question not related to querying their data."
-             f"Your answer should be either 'yes' or 'no' do not answer anything else."
-             f"Below are few examples"
-         ),
-         HumanMessagePromptTemplate.from_template("{text}")   
-        ]
-    )
-    prompt_value = template.invoke({"text":query})
-    prompt_value = prompt_value.to_string()
-    print(prompt_value)
-    answer = chat_llm(prompt_value)
-    print("query classification answer")
-    return answer
-
-def prompt_when_query_not_needed(query):
+    
+def check_if_users_query_want_general_schema_information_or_sql(query):
     template = ChatPromptTemplate.from_messages(
         [
             SystemMessagePromptTemplate.from_template(
-               f"You are a virtual assistant"
-               f"Generate a polite, concise response to the users message below."
-               f"Be clear and concise. Only respond to user message do not add any additional infromation."
+                
+                """
+                f"In the text given text user is asking a question about database "
+                f"Figure out whether user wants information about database schema or wants to write a SQL query"
+                f"Answer 'yes' if user wants information about database schema and 'no' if user wants to write a SQL query"
+
+                """
             ),
             HumanMessagePromptTemplate.from_template("{text}")
         ]
@@ -147,25 +153,51 @@ def prompt_when_query_not_needed(query):
     
     prompt_value = template.invoke({"text":query})
     prompt_value = prompt_value.to_string()
-    
-    answer = chat_llm(prompt_value)
-    
+    print(prompt_value)
+    answer = classify_llm(prompt_value)
+    print(f"chat answer : {answer}")
     return answer
 
 
-def generate_template_for_sql(query, table_info, db_uri):
+def prompt_when_user_want_general_db_information(query,db_uri):
+    template = ChatPromptTemplate.from_messages(
+        [
+            SystemMessagePromptTemplate.from_template(
+                
+                """
+                f"You are an assistant who writes SQL queries."
+                f"Given the text below, write a SQL query that answers the user's question."
+                f"Prepend and append the SQL query with three backticks '```'"
+                f"Write select query whenever possible"
+                f"Connection string to this database is {db_uri}"                
+
+                """
+            ),
+            HumanMessagePromptTemplate.from_template("{text}")        ]
+    )
+    
+    answer = chat_llm(template.format_messages(text=query))
+    
+    prompt_value = template.invoke({"text":query})
+    prompt_value = prompt_value.to_string()
+    print(f"Prompt to model for Non SQL user query: {prompt_value}")
+    answer = chat_llm(prompt_value)
+    print(f"LLM Response when user query is not for SQL : {answer}")
+    return answer
+
+
+def generate_template_for_sql(query, relevant_tables, table_info):
     template = ChatPromptTemplate.from_messages(
         [
             SystemMessagePromptTemplate.from_template(
 
-                    f"You are an assistant that can write SQL queries."
-                    f"Given the text below, write a SQL query that answers the user's question."
-                    f"Only output SQL queries. Do not add any additional output. You will be penalized if you add any additional information."
-                    f"DB connection string is {db_uri}"
-                    f"Here is a detailed description of the table(s): "
+                    f"You are an assistant that can write SQL queries for SQLite database."
+                    f"Given the text below, write a Standard ANSI SQL query that answers the user's question."
+                    f"Assume that there is/are SQL table(s) named '{relevant_tables}' "
+                    f"\nHere is a detailed description of the table(s):\n "
                     f"{table_info}"
-                    "Prepend and append the SQL query with three backticks '```'"
-                
+                    f"Prepend and append the SQL query with three backticks '```'"
+                    f"Only return a SQLite compatible SQL query"
 
             ),
             HumanMessagePromptTemplate.from_template("{text}"),
@@ -173,51 +205,83 @@ def generate_template_for_sql(query, table_info, db_uri):
     )
     prompt_value = template.invoke({"text":query})
     prompt_value = prompt_value.to_string()
-    
+    print(f"Prompt for SQL generation: {prompt_value}")
     answer = chat_llm(prompt_value)
-    
+    print(f"Response of SQL generation query: {answer}")
     return answer
 
 def get_output_from_llm(query, unique_id, db_uri):
     
-    #Check if user query wants a sql output
-    user_needs_sql_query = check_if_user_wants_sql_query(query=query)    
+    # Check if user query is for sql or general database schema
+    answer_to_question_general_schema = check_if_users_query_want_general_schema_information_or_sql(query=query)
     
-    # If user needs SQL query then get the list of tables and columns and call llm with sql query prompt
-    if user_needs_sql_query.lower().strip() == 'yes':
-        print("user needs SQL query")
+    if answer_to_question_general_schema == 'yes':
+        return prompt_when_user_want_general_db_information(query=query, db_uri = db_uri)
+    
+    else:
+        # Load vector DB and instantiate a retriver
+        vectordb = Chroma(embedding_function=embeddings, persist_directory="./vectors/tables_/"+ unique_id)
+        #retriever = vectordb.as_retriever()
+        
+        # Search for top 5 relevant docs from vector db
+        docs = vectordb.similarity_search(query,k=5)
+        print(f"List of relevant documents retrieved:\n\n{docs}")
+        
+        relevant_tables = []
+        relevant_tables_and_columns = []
 
+        for doc in docs:
+            table_name, column_name, data_type = doc.page_content.split('\n')
+            print(f"Table: {table_name}, Col: {column_name}, Type: {data_type}")
+            table_name=table_name.split(':')[1].strip()
+            relevant_tables.append(table_name)
+            column_name=column_name.split(':')[1].strip()
+            data_type = data_type.split(":")[1].strip()
+
+            relevant_tables_and_columns.append((table_name, column_name, data_type))
+            
         ## Load the tables csv
         filename_t = 'csvs/tables_' + unique_id + '.csv'
         df = pd.read_csv(filename_t)
         
+        # For each relevant table list down all the columns of the table
+        unique_tables = []
+        for table in relevant_tables:
+            if table not in unique_tables:
+                unique_tables.append(table)
+        unique_tables_list = ', '.join(unique_tables)
+                
         ## For each table create a string that lists down all the columns and their datatypes
         table_info = ''
-        for table in df['table_name']:
-            table_info += 'Information about table' + table + ':\n'
-            table_info += df[df['table_name'] == table].to_string(index=False) + '\n\n\n'
         
-        return {"is_query":True, "llm_response":generate_template_for_sql(query, table_info, db_uri)}
-    
-    else: 
-        print("user asked a general query")
-        return {"is_query":False, "llm_response":prompt_when_query_not_needed(query)}
+        table_info = ''
+        for table in unique_tables:
+            table_info += f"Table name: {table}\nColumn names and column data types:\n" 
+            for column,data_type in df[df['table_name'] == table][['column_name','data_type']].values:
+                table_info += f"{column}, {data_type}\n"
+            table_info += "\n\n"
+        
+        return generate_template_for_sql(query, unique_tables_list, table_info)
     
 
 
-def execute_the_solution(solution, db_uri,is_query):
+def execute_the_solution(solution, db_uri):
     
-    if is_query == True: 
-        connection = sqlite3.connect(db_uri)
-        cursor = connection.cursor()
-        
-        _,final_query,_ = solution.split("```")
-        final_query = final_query.strip('sql')
-        cursor.execute(final_query)
-        result = cursor.fetchall()
-        return str(result)
-    else:
-        return "Not a SQL query so didn't run anything!"
+    connection = sqlite3.connect(db_uri)
+    cursor = connection.cursor()
+    
+    _,final_query,_ = solution.split("```")
+    final_query = final_query.strip('sql')
+    cursor.execute(final_query)
+    
+    column_names = [desc[0] for desc in cursor.description]
+    result = cursor.fetchall()
+    df = pd.DataFrame(result, columns=column_names)
+    
+    print(f"SQL query output: {df}")
+
+    return df
+
 
 
 # Function to establish connection and read metadata from the database
@@ -228,8 +292,9 @@ def connect_with_db(uri):
 
 def send_message(message):
     solution = get_output_from_llm(message, st.session_state.unique_id, st.session_state.db_uri)
-    result = execute_the_solution(solution["llm_response"], st.session_state.db_uri,solution["is_query"])
-    return {"message":solution["llm_response"] + "\n\n" + "Result:\n" + result}
+    #print(f"Value of Solution : {solution}")
+    result = execute_the_solution(solution, st.session_state.db_uri)
+    return {"message":solution,"data":result}
 
 ## Instructions
 
@@ -279,10 +344,13 @@ if prompt := st.chat_input("What is up?"):
     st.session_state.messages.append({"role":"user", "content":prompt})
     
     # response
-    response = send_message(prompt)["message"]
+    response = send_message(prompt)
+    response_text = response["message"]
+    response_data = response["data"]
     # Display assistant response in chat message container
     with st.chat_message("assistant"):
-        st.markdown(response)
+        st.markdown(response_text)
+        st.dataframe(data=response_data)
     # Add assistant response to chat history
     st.session_state.messages.append({"role":"assistant", "content":response})
     
